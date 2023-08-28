@@ -2,105 +2,82 @@ package app
 
 import (
 	"context"
-	"errors"
-	"fmt"
+	gallery "github.com/Lineblaze/GwentGallery/app/internal"
+	"github.com/Lineblaze/GwentGallery/app/internal/core"
 	"github.com/Lineblaze/GwentGallery/app/internal/infrastructure/config"
-	"github.com/Lineblaze/GwentGallery/app/pkg/client/postgresql"
-	"github.com/Lineblaze/GwentGallery/app/pkg/logging"
-	"github.com/jackc/pgx/v4/pgxpool"
-	"github.com/julienschmidt/httprouter"
-	"github.com/rs/cors"
-	httpSwagger "github.com/swaggo/http-swagger"
-	"net"
-	"net/http"
+	"github.com/Lineblaze/GwentGallery/app/internal/infrastructure/logger"
+	"github.com/Lineblaze/GwentGallery/app/internal/interfaces/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
-type App struct {
-	cfg        *config.Config
-	router     *httprouter.Router
-	httpServer *http.Server
-	pgClient   *pgxpool.Pool
+type application struct {
+	core core.Core
 }
 
-func NewApp(ctx context.Context, config *config.Config) (App, error) {
-	logging.Info(ctx, "router initializing")
-	router := httprouter.New()
-
-	logging.Info(ctx, "swagger docs initializing")
-	router.Handler(http.MethodGet, "/swagger", http.RedirectHandler("/swagger/index.html", http.StatusMovedPermanently))
-	router.Handler(http.MethodGet, "/swagger/*any", httpSwagger.WrapHandler)
-
-	pgConfig := postgresql.NewPgConfig(
-		config.PostgreSQL.Username, config.PostgreSQL.Password,
-		config.PostgreSQL.Host, config.PostgreSQL.Port, config.PostgreSQL.Database,
-	)
-	pgClient, err := postgresql.NewClient(ctx, 5, time.Second*5, pgConfig)
+func New(configPath string) (gallery.Gallery, error) {
+	err := config.Init(configPath)
 	if err != nil {
-		logging.GetLogger().Fatal(ctx, err)
+		return nil, err
 	}
 
-	return App{
-		cfg:      config,
-		router:   router,
-		pgClient: pgClient,
+	loggerConfig := config.Config.Logger
+
+	logger.Init(&logger.Config{
+		LogToConsole:     loggerConfig.LogToConsole,
+		EncodeLogsAsJson: loggerConfig.EncodeLogsAsJson,
+		LogToFile:        loggerConfig.LogToFile,
+		Directory:        loggerConfig.Directory,
+		Filename:         loggerConfig.Filename,
+		MaxSize:          loggerConfig.MaxSize,
+		MaxBackups:       loggerConfig.MaxBackups,
+		MaxAge:           loggerConfig.MaxAge,
+	})
+
+	c, err := core.New(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	return &application{
+		core: c,
 	}, nil
 }
 
-func (a *App) Run(ctx context.Context) {
-	a.startHTTP(ctx)
+func (app *application) Start() error {
+	httpServer, err := http.NewHttpServer(app.core)
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		err := httpServer.Run()
+		if err != nil {
+			logger.Logger.Error().Err(err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signals := []os.Signal{syscall.SIGABRT, syscall.SIGQUIT, syscall.SIGHUP, os.Interrupt, syscall.SIGTERM}
+	signal.Notify(quit, signals...)
+
+	<-quit
+	logger.Logger.Info().Msg("Shutting down the server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		logger.Logger.Error().Msgf("server shutdown failed: %v", err)
+	}
+
+	logger.Logger.Info().Msg("Server has been shut down")
+
+	return nil
 }
 
-func (a *App) startHTTP(ctx context.Context) error {
-	logger := logging.WithFields(ctx, map[string]interface{}{
-		"IP":   a.cfg.HTTP.IP,
-		"Port": a.cfg.HTTP.Port,
-	})
-	logger.Info("HTTP Server initializing")
-
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", a.cfg.HTTP.IP, a.cfg.HTTP.Port))
-	if err != nil {
-		logger.WithError(err).Fatal("failed to create listener")
-	}
-
-	logger.WithFields(map[string]interface{}{
-		"AllowedMethods":     a.cfg.HTTP.CORS.AllowedMethods,
-		"AllowedOrigins":     a.cfg.HTTP.CORS.AllowedOrigins,
-		"AllowCredentials":   a.cfg.HTTP.CORS.AllowCredentials,
-		"AllowedHeaders":     a.cfg.HTTP.CORS.AllowedHeaders,
-		"OptionsPassthrough": a.cfg.HTTP.CORS.OptionsPassthrough,
-		"ExposedHeaders":     a.cfg.HTTP.CORS.ExposedHeaders,
-		"Debug":              a.cfg.HTTP.CORS.Debug,
-	})
-	c := cors.New(cors.Options{
-		AllowedMethods:     a.cfg.HTTP.CORS.AllowedMethods,
-		AllowedOrigins:     a.cfg.HTTP.CORS.AllowedOrigins,
-		AllowCredentials:   a.cfg.HTTP.CORS.AllowCredentials,
-		AllowedHeaders:     a.cfg.HTTP.CORS.AllowedHeaders,
-		OptionsPassthrough: a.cfg.HTTP.CORS.OptionsPassthrough,
-		ExposedHeaders:     a.cfg.HTTP.CORS.ExposedHeaders,
-		Debug:              a.cfg.HTTP.CORS.Debug,
-	})
-
-	handler := c.Handler(a.router)
-
-	a.httpServer = &http.Server{
-		Handler:      handler,
-		WriteTimeout: a.cfg.HTTP.WriteTimeout,
-		ReadTimeout:  a.cfg.HTTP.ReadTimeout,
-	}
-
-	if err = a.httpServer.Serve(listener); err != nil {
-		switch {
-		case errors.Is(err, http.ErrServerClosed):
-			logger.Warning("server shutdown")
-		default:
-			logger.Fatal(err)
-		}
-	}
-	err = a.httpServer.Shutdown(context.Background())
-	if err != nil {
-		logger.Fatal(err)
-	}
-	return err
+func (app *application) Stop(ctx context.Context) error {
+	return nil
 }

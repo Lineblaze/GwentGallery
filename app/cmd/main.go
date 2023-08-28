@@ -1,26 +1,29 @@
 package main
 
 import (
-	"context"
+	"flag"
 	"github.com/Lineblaze/GwentGallery/app/internal/app"
-	"github.com/Lineblaze/GwentGallery/app/internal/infrastructure/config"
-	"github.com/Lineblaze/GwentGallery/app/pkg/logging"
+	"github.com/joho/godotenv"
+	"log"
 )
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	logging.Info(ctx, "config initializing")
-	cfg := config.GetConfig()
-
-	ctx = logging.ContextWithLogger(ctx, logging.NewLogger())
-
-	a, err := app.NewApp(ctx, cfg)
-	if err != nil {
-		logging.Fatal(ctx, err)
+	readEnv := flag.String("env-file", ".env", "Path to application env file.")
+	configPath := flag.String("config-path", "config.yml", "Path to application config file.")
+	flag.Parse()
+	println(*configPath)
+	if *readEnv != "" {
+		if err := godotenv.Load(*readEnv); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	logging.Info(ctx, "Running Application")
-	a.Run(ctx)
+	application, err := app.New(*configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := application.Start(); err != nil {
+		log.Fatal(err)
+	}
 }
